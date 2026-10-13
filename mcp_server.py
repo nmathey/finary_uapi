@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from typing import Any
 
 # Force le répertoire de travail vers le dossier du script,
@@ -46,8 +47,9 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("finary-mcp")
 
-# ── Session globale réutilisée entre les appels ────────────────────────────────
+# ── Session authentifiée (mise à jour et sécurisée entre les appels) ───────
 _session = None
+_session_lock = threading.Lock()
 
 
 def get_session():
@@ -55,16 +57,20 @@ def get_session():
     Retourne une session authentifiée.
     prepare_session() relit le cookie sauvegardé par 'signin' et le renouvelle
     si besoin. Les credentials viennent de credentials.json (géré nativement par signin).
+    
+    On relance aussi la préparation à chaque appel pour éviter de réutiliser une
+    session expirée et pour synchroniser correctement les appels concurrentiels.
     """
     global _session
-    if _session is None:
+    with _session_lock:
         logger.info("Préparation de la session Finary…")
-        _session = prepare_session()
-        if _session is None:
+        session = prepare_session()
+        if session is None:
             raise RuntimeError(
                 "Impossible d'obtenir une session Finary. "
                 "Lancez d'abord : poetry run python -m finary_uapi signin"
             )
+        _session = session
         logger.info("Session Finary prête.")
     return _session
 
@@ -225,6 +231,7 @@ async def list_tools() -> list[types.Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    arguments = arguments or {}
     try:
         session = get_session()
         result = _dispatch(session, name, arguments)
@@ -354,8 +361,9 @@ def _wealth_summary(session) -> dict:
         "Crypto":                       (_safe_call(portfolio.get_portfolio_cryptos, session),         "__cryptos__"),
         "Fonds euros":                  (_safe_call(user_fonds_euro.get_user_fonds_euro, session),     "fonds_euro"),
         "Startups & PME":               (_safe_call(user_startups.get_user_startups, session),         "startups"),
-        "Crowdlending":                 (_safe_call(user_crowdlendings.get_user_crowdlendings, session),"crowdlendings"),
+        "Crowdlending":                 (_safe_call(user_crowdlendings.get_user_crowdlendings, session), "crowdlendings"),
         "Métaux précieux":              (_safe_call(user_precious_metals.get_user_precious_metals, session), "precious_metals"),
+        "Comptes bancaires":            (_safe_call(portfolio.get_portfolio, session, "checking_accounts"), "checking"),
         "Autres (actifs génériques)":   (_safe_call(user_generic_assets.get_user_generic_assets, session),  "generic_assets"),
     }
 
@@ -365,8 +373,10 @@ def _wealth_summary(session) -> dict:
     for label, (data, kind) in raw.items():
         if kind == "__cryptos__":
             slim = _slim_cryptos(data)
-        else:
+        elif kind in FIELDS:
             slim = _slim_response(data, FIELDS[kind])
+        else:
+            slim = _slim_response(data, [])
         summary[label] = slim
         grand_total += slim["total_eur"]
 
@@ -380,18 +390,20 @@ def _slim_dispatch(data: Any, kind: str) -> Any:
     """Allège la réponse d'un outil individuel."""
     return _slim_response(data, FIELDS.get(kind, []))
 
+
 def _dispatch(session, name: str, args: dict) -> Any:
     """Appelle la fonction finary_uapi correspondante au nom de l'outil MCP."""
+    args = args or {}
 
     if name == "finary_portfolio":
-        asset_type = args.get("type", "")
+        asset_type = str(args.get("type", "") or "")
         return portfolio.get_portfolio(session, asset_type) if asset_type else portfolio.get_portfolio(session)
 
     elif name == "finary_portfolio_distribution":
         return portfolio.get_portfolio_distribution(session)
 
     elif name == "finary_portfolio_timeseries":
-        return portfolio.get_portfolio_timeseries(session, args.get("period", "1m"))
+        return portfolio.get_portfolio_timeseries(session, str(args.get("period", "1m") or "1m"))
 
     elif name == "finary_investments":
         return _slim_dispatch(portfolio.get_portfolio_investments(session), "investments")
@@ -400,9 +412,9 @@ def _dispatch(session, name: str, args: dict) -> Any:
         return portfolio.get_portfolio_investments_dividends(session)
 
     elif name == "finary_investments_transactions":
-        return portfolio.get_portfolio_investments_transactions(
-            session, page=args.get("page", 1), per_page=args.get("per_page", 20)
-        )
+        page = max(1, int(args.get("page", 1) or 1))
+        per_page = max(1, int(args.get("per_page", 20) or 20))
+        return portfolio.get_portfolio_investments_transactions(session, page=page, per_page=per_page)
 
     elif name == "finary_cryptos":
         return _slim_cryptos(portfolio.get_portfolio_cryptos(session))
@@ -420,7 +432,7 @@ def _dispatch(session, name: str, args: dict) -> Any:
         return _slim_dispatch(user_crowdlendings.get_user_crowdlendings(session), "crowdlendings")
 
     elif name == "finary_crowdlendings_distribution":
-        return user_crowdlendings.get_user_crowdlendings(session)
+        return portfolio.get_portfolio_crowdlendings_distribution(session)
 
     elif name == "finary_fonds_euro":
         return _slim_dispatch(user_fonds_euro.get_user_fonds_euro(session), "fonds_euro")
@@ -435,9 +447,9 @@ def _dispatch(session, name: str, args: dict) -> Any:
         return _slim_dispatch(user_generic_assets.get_user_generic_assets(session), "generic_assets")
 
     elif name == "finary_checking_accounts_transactions":
-        return portfolio.get_portfolio_checking_accounts_transactions(
-            session, page=args.get("page", 1), per_page=args.get("per_page", 20)
-        )
+        page = max(1, int(args.get("page", 1) or 1))
+        per_page = max(1, int(args.get("per_page", 20) or 20))
+        return portfolio.get_portfolio_checking_accounts_transactions(session, page=page, per_page=per_page)
 
     elif name == "finary_me":
         return user_me.get_user_me(session)
