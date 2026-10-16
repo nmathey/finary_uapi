@@ -5,6 +5,7 @@ credentials.json
 jwt.json
 isoenv/
 venv/
+data-test/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
