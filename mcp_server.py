@@ -5,24 +5,34 @@ Finary MCP Server
 Expose l'API non-officielle Finary comme un serveur MCP (Model Context Protocol).
 Un LLM peut ainsi interroger directement votre portefeuille Finary.
 
-Prérequis :
-  - credentials.json à la racine (même format que credentials.json.tpl)
-  - poetry run python -m finary_uapi signin  (première connexion)
-  - poetry run python mcp_server.py
+Modes :
+  - MCP_TRANSPORT=http  (défaut) : serveur HTTP streamable sur /mcp + /health (Docker / service)
+  - MCP_TRANSPORT=stdio           : mode historique (Claude Desktop en local)
+
+Variables d'environnement :
+  FINARY_EMAIL, FINARY_PASSWORD   identifiants Finary
+  FINARY_TOTP_SECRET              secret TOTP (base32) -> reconnexion 100 % automatique
+  FINARY_DATA_DIR                 dossier où sont écrits jwt.json / cookies.txt (volume Docker)
+  MCP_AUTH_TOKEN                  (optionnel) token Bearer exigé sur /mcp
+  MCP_HOST / MCP_PORT             adresse d'écoute (0.0.0.0 / 8000)
 """
 
 import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import threading
+import time
 from typing import Any
 
 # Force le répertoire de travail vers le dossier du script,
 # afin que jwt.json, cookies.txt et credentials.json soient toujours trouvés,
 # quel que soit le cwd utilisé par Claude Desktop au lancement.
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+_DATA_DIR = os.environ.get("FINARY_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(_DATA_DIR, exist_ok=True)
+os.chdir(_DATA_DIR)
 
 import mcp.server.stdio
 import mcp.types as types
@@ -31,6 +41,7 @@ from mcp.server.models import InitializationOptions
 
 try:
     from finary_uapi.auth import prepare_session
+    from finary_uapi.signin import signin
     import finary_uapi.user_portfolio as portfolio
     import finary_uapi.user_me as user_me
     import finary_uapi.user_real_estates as user_real_estates
@@ -44,35 +55,92 @@ except ImportError as e:
     print(f"[ERREUR] Import finary_uapi échoué : {e}", file=sys.stderr)
     sys.exit(1)
 
+try:
+    import pyotp
+except ImportError:
+    pyotp = None  # le login auto TOTP sera indisponible
+
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("finary-mcp")
 
 # ── Session authentifiée (mise à jour et sécurisée entre les appels) ───────
 _session = None
 _session_lock = threading.Lock()
+_last_ok = 0.0                      # horodatage de la dernière validation réussie
+SESSION_CHECK_TTL = 300             # on revalide la session au plus toutes les 5 min
+TOTP_SECRET = os.environ.get("FINARY_TOTP_SECRET", "").replace(" ", "")
+
+
+def _fresh_totp() -> str:
+    """Code TOTP courant, en évitant une fenêtre sur le point d'expirer."""
+    if pyotp is None:
+        raise RuntimeError("Module pyotp absent : pip install pyotp")
+    totp = pyotp.TOTP(TOTP_SECRET)
+    remaining = totp.interval - (time.time() % totp.interval)
+    if remaining < 4:
+        time.sleep(remaining + 0.5)
+    return totp.now()
+
+
+def _session_is_valid(session) -> bool:
+    """Une session invalide fait renvoyer {} par l'API : on teste avec 'me'."""
+    try:
+        me = user_me.get_user_me(session)
+        return bool(me and me.get("result"))
+    except Exception as e:
+        logger.warning(f"Validation de session échouée : {e}")
+        return False
+
+
+def _auto_signin() -> None:
+    if not TOTP_SECRET:
+        raise RuntimeError(
+            "Session Finary expirée et FINARY_TOTP_SECRET absent : "
+            "reconnexion automatique impossible."
+        )
+    last_err = None
+    for attempt in (1, 2):
+        try:
+            signin(_fresh_totp())
+            logger.info("Reconnexion Finary (TOTP) réussie.")
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Échec du login (tentative {attempt}/2) : {e}")
+            if attempt == 1:
+                time.sleep(31)  # attendre la fenêtre TOTP suivante
+    raise RuntimeError(f"Login Finary impossible : {last_err}")
 
 
 def get_session():
     """
     Retourne une session authentifiée.
-    prepare_session() relit le cookie sauvegardé par 'signin' et le renouvelle
-    si besoin. Les credentials viennent de credentials.json (géré nativement par signin).
-    
-    On relance aussi la préparation à chaque appel pour éviter de réutiliser une
-    session expirée et pour synchroniser correctement les appels concurrentiels.
+    1. prepare_session() relit le cookie sauvegardé et renouvelle le JWT si besoin.
+    2. La session est validée (appel 'me', mis en cache SESSION_CHECK_TTL secondes).
+    3. Si elle est invalide : reconnexion automatique avec le code TOTP généré.
     """
-    global _session
+    global _session, _last_ok
     with _session_lock:
-        logger.info("Préparation de la session Finary…")
-        session = prepare_session()
-        if session is None:
-            raise RuntimeError(
-                "Impossible d'obtenir une session Finary. "
-                "Lancez d'abord : poetry run python -m finary_uapi signin"
-            )
+        session = None
+        try:
+            session = prepare_session()
+        except Exception as e:
+            logger.warning(f"prepare_session a échoué : {e}")
+
+        if session is not None and (time.time() - _last_ok) < SESSION_CHECK_TTL:
+            _session = session
+            return session
+
+        if session is None or not _session_is_valid(session):
+            logger.info("Session Finary invalide ou absente → reconnexion automatique.")
+            _auto_signin()
+            session = prepare_session()
+            if session is None or not _session_is_valid(session):
+                raise RuntimeError("Session Finary toujours invalide après reconnexion.")
+
+        _last_ok = time.time()
         _session = session
-        logger.info("Session Finary prête.")
-    return _session
+        return session
 
 
 def _json(data: Any) -> str:
@@ -233,8 +301,8 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     arguments = arguments or {}
     try:
-        session = get_session()
-        result = _dispatch(session, name, arguments)
+        session = await asyncio.to_thread(get_session)
+        result = await asyncio.to_thread(_dispatch, session, name, arguments)
         return [types.TextContent(type="text", text=_json(result))]
     except RuntimeError as e:
         return [types.TextContent(type="text", text=f"[ERREUR] {e}")]
@@ -342,10 +410,15 @@ FIELDS = {
 
 
 def _safe_call(fn, *args, **kwargs):
+    global _last_ok
     try:
         return fn(*args, **kwargs)
     except Exception as e:
         logger.warning(f"Erreur ({fn.__name__}): {e}")
+        msg = str(e).lower()
+        if any(k in msg for k in ("401", "403", "unauthorized", "forbidden", "expired")):
+            _last_ok = 0.0  # force une revalidation / reconnexion au prochain appel
+            raise RuntimeError(f"Session Finary expirée ({fn.__name__}) : réessayez.") from e
         return {}
 
 
@@ -462,8 +535,8 @@ def _dispatch(session, name: str, args: dict) -> Any:
 
 
 # ── Point d'entrée ─────────────────────────────────────────────────────────────
-async def main():
-    logger.info("Démarrage du serveur MCP Finary…")
+async def main_stdio():
+    logger.info("Démarrage du serveur MCP Finary (stdio)…")
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
@@ -479,5 +552,57 @@ async def main():
         )
 
 
+def build_http_app():
+    """Application ASGI : /mcp (streamable HTTP) + /health."""
+    import contextlib
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+    manager = StreamableHTTPSessionManager(app=app, stateless=True)
+
+    class MCPEndpoint:
+        async def __call__(self, scope, receive, send):
+            if auth_token:
+                headers = dict(scope.get("headers", []))
+                supplied = headers.get(b"authorization", b"").decode()
+                if not secrets.compare_digest(supplied, f"Bearer {auth_token}"):
+                    resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+                    await resp(scope, receive, send)
+                    return
+            await manager.handle_request(scope, receive, send)
+
+    async def health(request):
+        # /health        -> liveness (utilisé par le healthcheck Docker)
+        # /health?deep=1 -> vérifie aussi la session Finary (et se reconnecte si besoin)
+        if request.query_params.get("deep"):
+            try:
+                await asyncio.to_thread(get_session)
+            except Exception as e:
+                return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
+        age = int(time.time() - _last_ok) if _last_ok else None
+        return JSONResponse({"status": "ok", "last_session_check_age_s": age})
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with manager.run():
+            yield
+
+    return Starlette(
+        routes=[Route("/health", health), Route("/mcp", endpoint=MCPEndpoint())],
+        lifespan=lifespan,
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.environ.get("MCP_TRANSPORT", "http").lower() == "stdio":
+        asyncio.run(main_stdio())
+    else:
+        import uvicorn
+
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        logger.info(f"Démarrage du serveur MCP Finary (HTTP) sur {host}:{port}/mcp")
+        uvicorn.run(build_http_app(), host=host, port=port, log_level="info")
